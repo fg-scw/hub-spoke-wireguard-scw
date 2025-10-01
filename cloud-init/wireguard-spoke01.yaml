@@ -1,0 +1,159 @@
+#cloud-config
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    shell: /bin/bash
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - wireguard
+  - wireguard-tools
+  - iptables
+  - iptables-persistent
+  - net-tools
+  - vim
+  - htop
+  - curl
+  - tcpdump
+  - mtr-tiny
+  - iftop
+  - nload
+
+write_files:
+  - path: /etc/wireguard/wg0.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      [Interface]
+      PrivateKey = ${wg_private_key}
+      Address = ${wg_local_ip}/24
+      ListenPort = ${wg_port}
+      MTU = ${wg_mtu}
+
+      # Routage & firewall tunnel
+      PostUp   = echo 1 > /proc/sys/net/ipv4/ip_forward
+      PostUp   = iptables -A INPUT -i %i -j ACCEPT
+      PostUp   = iptables -A FORWARD -i %i -j ACCEPT
+      PostUp   = iptables -A FORWARD -o %i -j ACCEPT
+      PostUp   = iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+      # NAT des réseaux LOCAUX vers le HUB (sortie wg0)
+      %{ for subnet in local_subnets ~}
+      PostUp   = iptables -t nat -A POSTROUTING -s ${subnet} -o %i -j MASQUERADE
+      %{ endfor ~}
+
+      # PBR : intra-VPC local, le reste via wg0
+      PostUp   = ip route add default dev %i table 100
+      PostUp   = ip rule add to 172.16.32.0/23 lookup main pref 50
+      PostUp   = ip rule add from 172.16.32.0/23 table 100 pref 200
+
+      # Hairpin : permettre aux clients de joindre l'IP WG locale du spoke
+      PostUp   = ip route add local ${wg_local_ip}/32 dev lo table 100
+      PostUp   = ip rule add to ${wg_local_ip}/32 lookup 100 pref 10
+
+      # Nettoyage des caches de routage
+      PostUp   = ip -4 route flush cache
+
+      # MSS clamping
+      PostUp   = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+      PostDown = ip rule del to ${wg_local_ip}/32 lookup 100 pref 10
+      PostDown = ip route del local ${wg_local_ip}/32 dev lo table 100
+      PostDown = ip rule del from 172.16.32.0/23 table 100 pref 200
+      PostDown = ip rule del to 172.16.32.0/23 lookup main pref 50
+      PostDown = ip route del default dev %i table 100
+      %{ for subnet in local_subnets ~}
+      PostDown = iptables -t nat -D POSTROUTING -s ${subnet} -o %i -j MASQUERADE
+      %{ endfor ~}
+      PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      PostDown = iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      PostDown = iptables -D FORWARD -o %i -j ACCEPT
+      PostDown = iptables -D FORWARD -i %i -j ACCEPT
+      PostDown = iptables -D INPUT -i %i -j ACCEPT
+
+      %{ for peer in peers ~}
+      [Peer]
+      PublicKey = ${peer.public_key}
+      AllowedIPs = 0.0.0.0/0, ::/0
+      Endpoint = ${peer.endpoint}
+      PersistentKeepalive = 25
+
+      %{ endfor ~}
+
+  - path: /usr/local/bin/wg-monitor.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      while true; do
+        if ! wg show wg0 > /dev/null 2>&1; then
+          echo "$(date): WireGuard down, restarting..." >> /var/log/wireguard-monitor.log
+          systemctl restart wg-quick@wg0
+        fi
+        sleep 60
+      done
+
+  - path: /etc/systemd/system/wg-monitor.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=WireGuard Monitor
+      After=wg-quick@wg0.service
+      Wants=wg-quick@wg0.service
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/wg-monitor.sh
+      Restart=always
+      RestartSec=10
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/bin/wg-stats.sh
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      echo "=== Etat WireGuard ==="
+      wg show
+      echo ""
+      echo "=== Interfaces ==="
+      ip -4 addr show | grep inet
+      echo ""
+      echo "=== Table de routage (main) ==="
+      ip route
+      echo ""
+      echo "=== Table 100 ==="
+      ip route show table 100
+      echo ""
+      echo "=== Règles 'ip rule' ==="
+      ip rule
+      echo ""
+      echo "=== Statistiques NAT ==="
+      iptables -t nat -L -n -v | head -20
+
+  - path: /etc/sysctl.d/99-wireguard.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      net.ipv4.ip_forward=1
+      net.ipv4.conf.all.forwarding=1
+      net.ipv4.conf.all.rp_filter=0
+      net.ipv4.conf.default.rp_filter=0
+
+runcmd:
+  - sysctl -p /etc/sysctl.d/99-wireguard.conf
+  - systemctl enable wg-quick@wg0
+  - systemctl start wg-quick@wg0
+  - systemctl daemon-reload
+  - systemctl enable wg-monitor.service
+  - systemctl start wg-monitor.service
+  - netfilter-persistent save
+  - echo "Spoke01 prêt - intra-VPC local, inter-VPC/Internet via wg0 (PBR table 100 + hairpin)" > /etc/motd

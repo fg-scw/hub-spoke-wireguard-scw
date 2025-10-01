@@ -1,0 +1,42 @@
+#cloud-config
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    shell: /bin/bash
+  - name: root
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /home/ubuntu/.pgpass
+    owner: ubuntu:ubuntu
+    permissions: '0600'
+    content: |
+      ${db_endpoint}:${db_port}:${db_name}:dbadmin:${db_password}
+
+runcmd:
+  # === Routage client ===
+  # 1) Tout par défaut -> SPOKE (pour transiter Hub/Internet)
+  - ip route replace default via ${spoke_lan_ip} 2>/dev/null || ip route add default via ${spoke_lan_ip}
+
+  # 2) Intra-VPC : routes spécifiques vers les autres subnets du même VPC (si besoin)
+  - bash -lc "for s in ${intra_vpc_subnets_joined}; do ip route replace $s via ${vpc_gateway_ip} 2>/dev/null || ip route add $s via ${vpc_gateway_ip}; done"
+
+  # 3) Installer les paquets APRES avoir Internet
+  - apt-get update
+  - apt-get install -y postgresql-client netcat-openbsd
+
+  # 4) Qualité de vie psql
+  - echo 'export PGPASSFILE=/home/ubuntu/.pgpass' >> /home/ubuntu/.bashrc
+  - echo "alias dbconnect='psql -h ${db_endpoint} -p ${db_port} -U dbadmin -d ${db_name}'" >> /home/ubuntu/.bashrc
+
+  # 5) Sanity check
+  - bash -lc "ip route; ping -c1 8.8.8.8 || true"
+
+  - echo "Client DB prêt - default via SPOKE ${spoke_lan_ip}, intra-VPC via ${vpc_gateway_ip}" > /etc/motd
