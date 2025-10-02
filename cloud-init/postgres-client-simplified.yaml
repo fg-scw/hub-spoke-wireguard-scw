@@ -1,0 +1,31 @@
+#cloud-config
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    shell: /bin/bash
+  - name: root
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - netcat-openbsd
+
+write_files:
+  - path: /home/ubuntu/.pgpass
+    owner: ubuntu:ubuntu
+    permissions: '0600'
+    content: |
+      ${db_endpoint}:${db_port}:${db_name}:dbadmin:${db_password}
+
+runcmd:
+  - sleep 20
+  - ip route add default via 172.16.64.2 dev ens5 2>/dev/null || true
+  - apt-get install -y postgresql-client-16
+  - echo "export PGPASSFILE=/home/ubuntu/.pgpass" >> /home/ubuntu/.bashrc
+  - echo "alias dbconnect='psql -h ${db_endpoint} -p ${db_port} -U dbadmin -d ${db_name}'" >> /home/ubuntu/.bashrc

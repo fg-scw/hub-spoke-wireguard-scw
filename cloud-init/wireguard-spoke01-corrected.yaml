@@ -35,42 +35,20 @@ write_files:
       ListenPort = ${wg_port}
       MTU = ${wg_mtu}
 
-      # Routage & firewall tunnel
-      PostUp   = echo 1 > /proc/sys/net/ipv4/ip_forward
-      PostUp   = iptables -A INPUT -i %i -j ACCEPT
-      PostUp   = iptables -A FORWARD -i %i -j ACCEPT
-      PostUp   = iptables -A FORWARD -o %i -j ACCEPT
-      PostUp   = iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      # Regles iptables pour NAT et routage
+      PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward
+      PostUp = iptables -A INPUT -i %i -j ACCEPT
+      PostUp = iptables -A FORWARD -i %i -j ACCEPT
+      PostUp = iptables -A FORWARD -o %i -j ACCEPT
+      PostUp = iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      PostUp = iptables -t nat -A POSTROUTING -s 192.168.1.0/24 ! -d 192.168.1.0/24 -j MASQUERADE
+      PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      # Routes statiques pour les reseaux prives
+      PostUp = ip route add 172.16.0.0/16 dev %i
 
-      # NAT des réseaux LOCAUX vers le HUB (sortie wg0)
-      %{ for subnet in local_subnets ~}
-      PostUp   = iptables -t nat -A POSTROUTING -s ${subnet} -o %i -j MASQUERADE
-      %{ endfor ~}
-
-      # PBR : intra-VPC local, le reste via wg0
-      PostUp   = ip route add default dev %i table 100
-      PostUp   = ip rule add to 172.16.32.0/23 lookup main pref 50
-      PostUp   = ip rule add from 172.16.32.0/23 table 100 pref 200
-
-      # Hairpin : permettre aux clients de joindre l'IP WG locale du spoke
-      PostUp   = ip route add local ${wg_local_ip}/32 dev lo table 100
-      PostUp   = ip rule add to ${wg_local_ip}/32 lookup 100 pref 10
-
-      # Nettoyage des caches de routage
-      PostUp   = ip -4 route flush cache
-
-      # MSS clamping
-      PostUp   = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-      PostDown = ip rule del to ${wg_local_ip}/32 lookup 100 pref 10
-      PostDown = ip route del local ${wg_local_ip}/32 dev lo table 100
-      PostDown = ip rule del from 172.16.32.0/23 table 100 pref 200
-      PostDown = ip rule del to 172.16.32.0/23 lookup main pref 50
-      PostDown = ip route del default dev %i table 100
-      %{ for subnet in local_subnets ~}
-      PostDown = iptables -t nat -D POSTROUTING -s ${subnet} -o %i -j MASQUERADE
-      %{ endfor ~}
+      PostDown = ip route del 172.16.0.0/16 dev %i
       PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      PostDown = iptables -t nat -D POSTROUTING -s 192.168.1.0/24 ! -d 192.168.1.0/24 -j MASQUERADE
       PostDown = iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
       PostDown = iptables -D FORWARD -o %i -j ACCEPT
       PostDown = iptables -D FORWARD -i %i -j ACCEPT
@@ -79,7 +57,7 @@ write_files:
       %{ for peer in peers ~}
       [Peer]
       PublicKey = ${peer.public_key}
-      AllowedIPs = 0.0.0.0/0, ::/0
+      AllowedIPs = ${peer.allowed_ips}
       Endpoint = ${peer.endpoint}
       PersistentKeepalive = 25
 
@@ -90,6 +68,7 @@ write_files:
     permissions: '0755'
     content: |
       #!/bin/bash
+      # Script de monitoring WireGuard
       while true; do
         if ! wg show wg0 > /dev/null 2>&1; then
           echo "$(date): WireGuard down, restarting..." >> /var/log/wireguard-monitor.log
@@ -124,36 +103,43 @@ write_files:
       echo "=== Etat WireGuard ==="
       wg show
       echo ""
-      echo "=== Interfaces ==="
+      echo "=== Connectivite reseau ==="
       ip -4 addr show | grep inet
       echo ""
-      echo "=== Table de routage (main) ==="
+      echo "=== Table de routage ==="
       ip route
-      echo ""
-      echo "=== Table 100 ==="
-      ip route show table 100
-      echo ""
-      echo "=== Règles 'ip rule' ==="
-      ip rule
       echo ""
       echo "=== Statistiques NAT ==="
       iptables -t nat -L -n -v | head -20
 
-  - path: /etc/sysctl.d/99-wireguard.conf
-    owner: root:root
-    permissions: '0644'
-    content: |
-      net.ipv4.ip_forward=1
-      net.ipv4.conf.all.forwarding=1
-      net.ipv4.conf.all.rp_filter=0
-      net.ipv4.conf.default.rp_filter=0
-
 runcmd:
+  # Configuration systeme
+  - echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard.conf
+  - echo "net.ipv4.conf.all.forwarding=1" >> /etc/sysctl.d/99-wireguard.conf
+  - echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.d/99-wireguard.conf
+  - echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.d/99-wireguard.conf
   - sysctl -p /etc/sysctl.d/99-wireguard.conf
+  
+  # Configuration des interfaces reseau pour eviter les conflits
+  - echo "iface eth1 inet manual" >> /etc/network/interfaces.d/50-cloud-init
+  
+  # Démarrage de WireGuard
   - systemctl enable wg-quick@wg0
   - systemctl start wg-quick@wg0
+  
+  # Démarrage du monitoring
   - systemctl daemon-reload
   - systemctl enable wg-monitor.service
   - systemctl start wg-monitor.service
+  
+  # Sauvegarde des regles iptables
   - netfilter-persistent save
-  - echo "Spoke01 prêt - intra-VPC local, inter-VPC/Internet via wg0 (PBR table 100 + hairpin)" > /etc/motd
+  
+  # Vérification du statut apres 10 secondes
+  - sleep 10
+  - wg show > /var/log/wireguard-initial.log 2>&1
+  - ip route > /var/log/routes-initial.log 2>&1
+  
+  # Message de fin
+  - echo "WireGuard Spoke-01 configure avec succes" > /etc/motd
+  - echo "Utilisez 'wg-stats.sh' pour voir l'état du VPN" >> /etc/motd

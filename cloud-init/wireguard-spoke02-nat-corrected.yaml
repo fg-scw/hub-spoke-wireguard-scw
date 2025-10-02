@@ -1,0 +1,90 @@
+#cloud-config
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    shell: /bin/bash
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - wireguard
+  - wireguard-tools
+  - iptables
+  - iptables-persistent
+  - net-tools
+  - vim
+  - htop
+  - curl
+  - tcpdump
+
+write_files:
+  - path: /etc/wireguard/wg0.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      [Interface]
+      PrivateKey = ${wg_private_key}
+      Address = ${wg_local_ip}/24
+      ListenPort = ${wg_port}
+      MTU = ${wg_mtu}
+
+      # Spoke02 NAT vers Hub - Configuration CORRIGEE
+      PostUp = echo 1 > /proc/sys/net/ipv4/ip_forward
+      PostUp = iptables -A INPUT -i %i -j ACCEPT
+      PostUp = iptables -A FORWARD -i %i -j ACCEPT
+      PostUp = iptables -A FORWARD -o %i -j ACCEPT
+      PostUp = iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      
+      # NAT des réseaux locaux vers WireGuard
+      PostUp = iptables -t nat -A POSTROUTING -s 172.16.64.0/23 -o %i -j MASQUERADE
+      PostUp = iptables -t nat -A POSTROUTING -s 172.16.66.0/23 -o %i -j MASQUERADE
+      
+      # Forwarding bidirectionnel pour les reseaux locaux
+      PostUp = iptables -A FORWARD -s 172.16.64.0/23 -j ACCEPT
+      PostUp = iptables -A FORWARD -s 172.16.66.0/23 -j ACCEPT
+      PostUp = iptables -A FORWARD -d 172.16.64.0/23 -j ACCEPT
+      PostUp = iptables -A FORWARD -d 172.16.66.0/23 -j ACCEPT
+      
+      # MSS clamping pour eviter la fragmentation
+      PostUp = iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+      PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+      PostDown = iptables -D FORWARD -d 172.16.66.0/23 -j ACCEPT
+      PostDown = iptables -D FORWARD -d 172.16.64.0/23 -j ACCEPT
+      PostDown = iptables -D FORWARD -s 172.16.66.0/23 -j ACCEPT
+      PostDown = iptables -D FORWARD -s 172.16.64.0/23 -j ACCEPT
+      PostDown = iptables -t nat -D POSTROUTING -s 172.16.66.0/23 -o %i -j MASQUERADE
+      PostDown = iptables -t nat -D POSTROUTING -s 172.16.64.0/23 -o %i -j MASQUERADE
+      PostDown = iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      PostDown = iptables -D FORWARD -o %i -j ACCEPT
+      PostDown = iptables -D FORWARD -i %i -j ACCEPT
+      PostDown = iptables -D INPUT -i %i -j ACCEPT
+
+      %{ for peer in peers ~}
+      [Peer]
+      PublicKey = ${peer.public_key}
+      AllowedIPs = ${peer.allowed_ips}
+      Endpoint = ${peer.endpoint}
+      PersistentKeepalive = 25
+
+      %{ endfor ~}
+
+  - path: /etc/sysctl.d/99-wireguard.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      net.ipv4.ip_forward=1
+      net.ipv4.conf.all.forwarding=1
+      net.ipv4.conf.all.rp_filter=0
+      net.ipv4.conf.default.rp_filter=0
+
+runcmd:
+  - sysctl -p /etc/sysctl.d/99-wireguard.conf
+  - systemctl enable wg-quick@wg0
+  - systemctl start wg-quick@wg0
+  - netfilter-persistent save
+  - echo "Spoke02 WireGuard NAT to Hub" > /etc/motd

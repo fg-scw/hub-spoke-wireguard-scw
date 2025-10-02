@@ -1,54 +1,40 @@
-########################################
-# VPC + Private Networks
-########################################
-
-resource "scaleway_vpc" "main" {
-  name                             = "main-vpc"
-  region                           = var.region
-  enable_routing                   = true
-  enable_custom_routes_propagation = true
+# VPCs
+resource "scaleway_vpc" "vpcs" {
+  for_each = local.vpcs
+  
+  name           = each.value.name
+  region         = var.region
+  tags           = each.value.tags
+  enable_routing = true
 }
 
-# HUB PN (172.16.10.0/23)
-resource "scaleway_vpc_private_network" "hub" {
-  name   = "pn-hub"
+# Réseaux privés - HUB et SPOKE 01 (un réseau chacun)
+resource "scaleway_vpc_private_network" "simple_networks" {
+  for_each = {
+    hub      = local.vpcs.hub
+    spoke_01 = local.vpcs.spoke_01
+  }
+  
+  name   = "rpn-${each.key}"
+  vpc_id = scaleway_vpc.vpcs[each.key].id
   region = var.region
-  vpc_id = scaleway_vpc.main.id
-
+  tags   = concat(each.value.tags, ["private-network"])
+  
   ipv4_subnet {
-    subnet = "172.16.10.0/23"
+    subnet = each.value.subnet
   }
 }
 
-# SPOKE01 PN (172.16.32.0/23)
-resource "scaleway_vpc_private_network" "spoke01" {
-  name   = "pn-spoke01"
+# Réseaux privés pour SPOKE 02 (deux réseaux)
+resource "scaleway_vpc_private_network" "spoke_02_networks" {
+  for_each = local.vpcs.spoke_02.subnets
+  
+  name   = "rpn-spoke-02-${each.key}"
+  vpc_id = scaleway_vpc.vpcs["spoke_02"].id
   region = var.region
-  vpc_id = scaleway_vpc.main.id
-
+  tags   = concat(local.vpcs.spoke_02.tags, ["private-network", "network-${each.key}"])
+  
   ipv4_subnet {
-    subnet = "172.16.32.0/23"
-  }
-}
-
-# SPOKE02-A PN (172.16.64.0/23)
-resource "scaleway_vpc_private_network" "spoke02_a" {
-  name   = "pn-spoke02-a"
-  region = var.region
-  vpc_id = scaleway_vpc.main.id
-
-  ipv4_subnet {
-    subnet = "172.16.64.0/23"
-  }
-}
-
-# SPOKE02-B PN (172.16.66.0/23)
-resource "scaleway_vpc_private_network" "spoke02_b" {
-  name   = "pn-spoke02-b"
-  region = var.region
-  vpc_id = scaleway_vpc.main.id
-
-  ipv4_subnet {
-    subnet = "172.16.66.0/23"
+    subnet = each.value
   }
 }
