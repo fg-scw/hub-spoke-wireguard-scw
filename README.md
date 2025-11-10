@@ -170,7 +170,7 @@ L'infrastructure expose les outputs suivants :
 - Script `wg-stats.sh` pour diagnostic réseau
 - Logs dans `/var/log/wireguard-*.log`
 
-## 🛠️ Maintenance
+## Maintenance
 
 ### Vérifier la Connectivité
 
